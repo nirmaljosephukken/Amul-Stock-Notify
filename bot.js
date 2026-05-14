@@ -31,7 +31,7 @@ const BOT_TOKEN               = process.env.BOT_TOKEN               || "YOUR_BOT
 const RAZORPAY_KEY_ID         = process.env.RAZORPAY_KEY_ID         || "YOUR_KEY_ID";
 const RAZORPAY_KEY_SECRET     = process.env.RAZORPAY_KEY_SECRET     || "YOUR_KEY_SECRET";
 const RAZORPAY_WEBHOOK_SECRET = process.env.RAZORPAY_WEBHOOK_SECRET || "YOUR_WEBHOOK_SECRET";
-const WEBHOOK_PORT            = parseInt(process.env.WEBHOOK_PORT   || "3000", 10);
+const WEBHOOK_PORT            = process.env.PORT                    || 3000;
 const PUBLIC_URL              = (process.env.PUBLIC_URL             || "").replace(/\/$/, "");
 
 // Subscription plans – amount in paise (INR × 100)
@@ -349,7 +349,15 @@ app.listen(WEBHOOK_PORT, () => {
 });
 
 // ─── TELEGRAM BOT ─────────────────────────────────────────────────────────────
-const bot = new TelegramBot(BOT_TOKEN, { polling: true });
+const bot = new TelegramBot(BOT_TOKEN, {
+  polling: {
+    interval: 300,
+    autoStart: true,
+    params: {
+      timeout: 10
+    }
+  }
+});
 
 // In-memory sessions for multi-step flows (phone entry, OTP)
 const sessions  = {};
