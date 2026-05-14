@@ -14,6 +14,8 @@
  *                             (used as the Razorpay callback URL after payment)
  */
 
+require('dotenv').config();
+
 "use strict";
 
 const TelegramBot = require("node-telegram-bot-api");
