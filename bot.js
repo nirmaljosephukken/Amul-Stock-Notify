@@ -1,22 +1,19 @@
+"use strict";
+
 /**
  * Amul Protein Stock Tracker Bot
- *
- * Dependencies:
- *   npm install node-telegram-bot-api axios node-cron better-sqlite3 razorpay express
  *
  * Environment variables:
  *   BOT_TOKEN               – Telegram bot token from @BotFather
  *   RAZORPAY_KEY_ID         – Razorpay API key ID
  *   RAZORPAY_KEY_SECRET     – Razorpay API key secret
  *   RAZORPAY_WEBHOOK_SECRET – Webhook secret set in Razorpay dashboard
- *   WEBHOOK_PORT            – Port for the HTTP server (default: 3000)
- *   PUBLIC_URL              – Your public HTTPS URL, e.g. https://yourapp.railway.app
- *                             (used as the Razorpay callback URL after payment)
+ *   PUBLIC_URL              – Your public HTTPS URL (e.g. https://yourapp.railway.app)
+ *   DB_PATH                 – Optional: path for SQLite file (default: /tmp/amul_bot.db)
+ *   PORT                    – HTTP server port (Railway sets this automatically)
  */
 
-require('dotenv').config();
-
-"use strict";
+require("dotenv").config();
 
 const TelegramBot = require("node-telegram-bot-api");
 const axios       = require("axios");
@@ -27,14 +24,18 @@ const express     = require("express");
 const crypto      = require("crypto");
 
 // ─── CONFIG ──────────────────────────────────────────────────────────────────
-const BOT_TOKEN               = process.env.BOT_TOKEN               || "YOUR_BOT_TOKEN";
-const RAZORPAY_KEY_ID         = process.env.RAZORPAY_KEY_ID         || "YOUR_KEY_ID";
-const RAZORPAY_KEY_SECRET     = process.env.RAZORPAY_KEY_SECRET     || "YOUR_KEY_SECRET";
-const RAZORPAY_WEBHOOK_SECRET = process.env.RAZORPAY_WEBHOOK_SECRET || "YOUR_WEBHOOK_SECRET";
-const WEBHOOK_PORT            = process.env.PORT                    || 3000;
-const PUBLIC_URL              = (process.env.PUBLIC_URL             || "").replace(/\/$/, "");
 
-// Subscription plans – amount in paise (INR × 100)
+const BOT_TOKEN               = process.env.BOT_TOKEN               || "";
+const RAZORPAY_KEY_ID         = process.env.RAZORPAY_KEY_ID         || "";
+const RAZORPAY_KEY_SECRET     = process.env.RAZORPAY_KEY_SECRET     || "";
+const RAZORPAY_WEBHOOK_SECRET = process.env.RAZORPAY_WEBHOOK_SECRET || "";
+const PORT                    = parseInt(process.env.PORT || "3000", 10);
+const PUBLIC_URL              = (process.env.PUBLIC_URL || "").replace(/\/$/, "");
+const DB_PATH                 = process.env.DB_PATH || "/tmp/amul_bot.db";
+
+if (!BOT_TOKEN) { console.error("FATAL: BOT_TOKEN is not set"); process.exit(1); }
+
+// Subscription plans — amounts in paise (INR × 100)
 const PLANS = {
   "3day":  { label: "3 Days",  days: 3,  amount: 500,  display: "₹5"  },
   "week":  { label: "1 Week",  days: 7,  amount: 1000, display: "₹10" },
@@ -45,7 +46,9 @@ const AMUL_BASE    = "https://shop.amul.com";
 const AMUL_HEADERS = { "x-store-domain": "shop.amul.com" };
 
 // ─── DATABASE ─────────────────────────────────────────────────────────────────
-const db = new Database("amul_bot.db");
+
+const db = new Database(DB_PATH);
+db.pragma("journal_mode = WAL");
 
 db.exec(`
   CREATE TABLE IF NOT EXISTS users (
@@ -91,6 +94,7 @@ db.exec(`
 `);
 
 // ─── DB HELPERS ───────────────────────────────────────────────────────────────
+
 const getUser = (userId) =>
   db.prepare("SELECT * FROM users WHERE user_id = ?").get(userId);
 
@@ -100,22 +104,52 @@ function upsertUser(userId, data = {}) {
   }
   if (!Object.keys(data).length) return;
   const sets = Object.keys(data).map((k) => `${k} = ?`).join(", ");
-  db.prepare(`UPDATE users SET ${sets} WHERE user_id = ?`).run(...Object.values(data), userId);
+  db.prepare(`UPDATE users SET ${sets} WHERE user_id = ?`)
+    .run(...Object.values(data), userId);
 }
 
 const isSubscribed = (user) =>
   !!user?.sub_expires && user.sub_expires > Math.floor(Date.now() / 1000);
 
+// ─── TELEGRAM BOT (defined early so webhook handler can use it) ───────────────
+
+const bot = new TelegramBot(BOT_TOKEN, {
+  polling: {
+    interval: 300,
+    autoStart: true,
+    params: { timeout: 10 },
+  },
+});
+
+bot.on("polling_error", (err) =>
+  console.error("[Polling error]", err.code, err.message)
+);
+
+// In-memory sessions for multi-step flows
+const sessions     = {};
+const getSession   = (id) => { if (!sessions[id]) sessions[id] = { state: null, data: {} }; return sessions[id]; };
+const clearSession = (id) => { sessions[id] = { state: null, data: {} }; };
+
+// MarkdownV2 escaper
+const esc = (s) => String(s ?? "").replace(/[_*[\]()~`>#+=|{}.!-]/g, "\\$&");
+
 // ─── AMUL API ─────────────────────────────────────────────────────────────────
+
 async function getSubstore(pincode) {
   try {
-    const url =
-      `${AMUL_BASE}/api/1/entity/ms.settings` +
-      `?filters=%5B%7B%22field%22%3A%22substore_zipcodes%22%2C%22value%22%3A%22${pincode}%22%2C%22operator%22%3A%22regex%22%7D%5D`;
-    const { data } = await axios.get(url, { headers: AMUL_HEADERS });
+    const filters = encodeURIComponent(
+      JSON.stringify([{ field: "substore_zipcodes", value: pincode, operator: "regex" }])
+    );
+    const { data } = await axios.get(
+      `${AMUL_BASE}/api/1/entity/ms.settings?filters=${filters}`,
+      { headers: AMUL_HEADERS, timeout: 10000 }
+    );
     const s = data?.data?.[0];
     return s ? { name: s.name } : null;
-  } catch { return null; }
+  } catch (e) {
+    console.error("[Amul] getSubstore:", e.message);
+    return null;
+  }
 }
 
 async function fetchProducts(substore) {
@@ -129,7 +163,7 @@ async function fetchProducts(substore) {
     });
     const { data } = await axios.get(
       `${AMUL_BASE}/api/1/entity/ms.products?${params}`,
-      { headers: { ...AMUL_HEADERS, "x-substore": substore || "default" } }
+      { headers: { ...AMUL_HEADERS, "x-substore": substore || "default" }, timeout: 10000 }
     );
     return data?.data || [];
   } catch (e) {
@@ -143,10 +177,13 @@ async function amulSendOtp(phone) {
     const { data } = await axios.post(
       `${AMUL_BASE}/api/1/entity/ms.users?cmd=login_otp`,
       { phone: `+91${phone}`, country_code: "+91" },
-      { headers: { ...AMUL_HEADERS, "Content-Type": "application/json" } }
+      { headers: { ...AMUL_HEADERS, "Content-Type": "application/json" }, timeout: 10000 }
     );
     return data;
-  } catch { return null; }
+  } catch (e) {
+    console.error("[Amul] amulSendOtp:", e.message);
+    return null;
+  }
 }
 
 async function amulVerifyOtp(phone, otp) {
@@ -154,17 +191,23 @@ async function amulVerifyOtp(phone, otp) {
     const { data } = await axios.post(
       `${AMUL_BASE}/api/1/entity/ms.users?cmd=login_verify_otp`,
       { phone: `+91${phone}`, otp, country_code: "+91" },
-      { headers: { ...AMUL_HEADERS, "Content-Type": "application/json" } }
+      { headers: { ...AMUL_HEADERS, "Content-Type": "application/json" }, timeout: 10000 }
     );
     return data;
-  } catch { return null; }
+  } catch (e) {
+    console.error("[Amul] amulVerifyOtp:", e.message);
+    return null;
+  }
 }
 
 async function fetchAmulAddress(token, substore) {
   try {
     const { data } = await axios.get(
       `${AMUL_BASE}/api/1/entity/ms.carts?cmd=getUserCart`,
-      { headers: { ...AMUL_HEADERS, "x-substore": substore, Authorization: `Bearer ${token}` } }
+      {
+        headers: { ...AMUL_HEADERS, "x-substore": substore, Authorization: `Bearer ${token}` },
+        timeout: 10000,
+      }
     );
     return data?.cart?.shipping_address?.address || null;
   } catch { return null; }
@@ -180,31 +223,30 @@ async function addToCart(token, substore, alias) {
           ...AMUL_HEADERS, "x-substore": substore,
           Authorization: `Bearer ${token}`, "Content-Type": "application/json",
         },
+        timeout: 10000,
       }
     );
     return data;
-  } catch { return null; }
+  } catch (e) {
+    console.error("[Amul] addToCart:", e.message);
+    return null;
+  }
 }
 
 // ─── RAZORPAY ─────────────────────────────────────────────────────────────────
+
 const rzp = new Razorpay({ key_id: RAZORPAY_KEY_ID, key_secret: RAZORPAY_KEY_SECRET });
 
-/**
- * Creates a Razorpay Payment Link.
- * user_id and plan are embedded in `notes` — the webhook uses them to
- * identify which user paid and which plan to activate.
- */
 async function createPaymentLink(userId, plan) {
-  const p = PLANS[plan];
+  const p    = PLANS[plan];
   const link = await rzp.paymentLink.create({
-    amount: p.amount,
-    currency: "INR",
-    accept_partial: false,
-    description: `Amul Stock Bot — ${p.label} Plan`,
-    notes: { user_id: String(userId), plan },
-    notify: { sms: false, email: false },
+    amount:          p.amount,
+    currency:        "INR",
+    accept_partial:  false,
+    description:     `Amul Stock Bot — ${p.label} Plan`,
+    notes:           { user_id: String(userId), plan },
+    notify:          { sms: false, email: false },
     reminder_enable: false,
-    // Redirect user back to a confirmation page after payment
     ...(PUBLIC_URL
       ? { callback_url: `${PUBLIC_URL}/payment/success`, callback_method: "get" }
       : {}),
@@ -214,13 +256,9 @@ async function createPaymentLink(userId, plan) {
     "INSERT OR REPLACE INTO payments (user_id, payment_link_id, plan, amount) VALUES (?, ?, ?, ?)"
   ).run(userId, link.id, plan, p.amount);
 
-  return link; // link.short_url is the hosted Razorpay checkout page
+  return link;
 }
 
-/**
- * Activates a user's subscription after Razorpay confirms payment via webhook.
- * Called automatically — no user action needed.
- */
 async function activateSubscription(paymentLinkId) {
   const row = db
     .prepare("SELECT * FROM payments WHERE payment_link_id = ? AND status = 'pending'")
@@ -241,15 +279,15 @@ async function activateSubscription(paymentLinkId) {
     day: "numeric", month: "long", year: "numeric",
   });
 
-  console.log(`[Webhook] Subscription activated for user ${row.user_id} — plan: ${row.plan}`);
+  console.log(`[Webhook] Subscription activated — user ${row.user_id}, plan: ${row.plan}`);
 
   try {
     await bot.sendMessage(
       row.user_id,
       `🎉 *Payment confirmed — Subscription activated\\!*\n\n` +
-        `Plan: ${esc(p.label)}\n` +
-        `Expires: ${esc(expiryDate)}\n\n` +
-        `Next: use /login to link your Amul account so the bot can auto\\-order for you\\.`,
+      `Plan: ${esc(p.label)}\n` +
+      `Expires: ${esc(expiryDate)}\n\n` +
+      `Next: use /login to link your Amul account so the bot can auto\\-order for you\\.`,
       { parse_mode: "MarkdownV2" }
     );
   } catch (e) {
@@ -258,36 +296,27 @@ async function activateSubscription(paymentLinkId) {
 }
 
 // ─── EXPRESS WEBHOOK SERVER ───────────────────────────────────────────────────
+
 const app = express();
 
-// Raw body required for HMAC signature verification — must come before express.json()
+// Raw body for HMAC verification — must be registered before express.json()
 app.use("/razorpay/webhook", express.raw({ type: "application/json" }));
 app.use(express.json());
 
-/**
- * Razorpay Webhook receiver.
- *
- * Setup in Razorpay Dashboard → Settings → Webhooks:
- *   URL:    https://your-public-url.com/razorpay/webhook
- *   Events: ✅ payment_link.paid
- *   Secret: same value as RAZORPAY_WEBHOOK_SECRET env var
- */
 app.post("/razorpay/webhook", async (req, res) => {
   const signature = req.headers["x-razorpay-signature"];
-  const rawBody   = req.body; // Buffer (raw body preserved above)
+  const rawBody   = req.body; // Buffer
 
-  // 1. Verify HMAC-SHA256 signature
   const expectedSig = crypto
     .createHmac("sha256", RAZORPAY_WEBHOOK_SECRET)
     .update(rawBody)
     .digest("hex");
 
   if (!signature || signature !== expectedSig) {
-    console.warn("[Webhook] Signature mismatch — rejecting request");
+    console.warn("[Webhook] Signature mismatch — rejecting");
     return res.status(400).json({ error: "Invalid signature" });
   }
 
-  // 2. Parse event
   let event;
   try {
     event = JSON.parse(rawBody.toString());
@@ -295,21 +324,17 @@ app.post("/razorpay/webhook", async (req, res) => {
     return res.status(400).json({ error: "Malformed JSON" });
   }
 
-  console.log("[Webhook] Received event:", event.event);
+  console.log("[Webhook] Event:", event.event);
 
-  // 3. Handle payment_link.paid
   if (event.event === "payment_link.paid") {
     const linkId = event.payload?.payment_link?.entity?.id;
-    if (linkId) {
-      await activateSubscription(linkId);
-    }
+    if (linkId) await activateSubscription(linkId);
   }
 
-  // Always respond 200 so Razorpay doesn't retry
   res.json({ ok: true });
 });
 
-// Confirmation page Razorpay redirects to after payment
+// Razorpay post-payment redirect page
 app.get("/payment/success", (_req, res) => {
   res.send(`
     <!DOCTYPE html>
@@ -321,53 +346,39 @@ app.get("/payment/success", (_req, res) => {
       <style>
         body { font-family: -apple-system, sans-serif; text-align: center;
                padding: 60px 20px; background: #f6f4e9; color: #210803; }
-        h1 { font-size: 2rem; margin-bottom: 12px; }
-        p  { color: #555; max-width: 420px; margin: 0 auto 24px; }
-        .badge { font-size: 3rem; display: block; margin-bottom: 16px; }
+        h1   { font-size: 2rem; margin-bottom: 12px; }
+        p    { color: #555; max-width: 420px; margin: 0 auto 24px; }
+        .ico { font-size: 3.5rem; display: block; margin-bottom: 16px; }
       </style>
     </head>
     <body>
-      <span class="badge">✅</span>
+      <span class="ico">✅</span>
       <h1>Payment Successful!</h1>
-      <p>Your subscription is being activated. Return to Telegram — you'll receive a confirmation message in a few seconds.</p>
+      <p>Your subscription is being activated. Return to Telegram — you'll receive a confirmation in a few seconds.</p>
       <p><strong>You can close this tab.</strong></p>
     </body>
     </html>
   `);
 });
 
-// Health-check endpoint (useful for Railway / Render uptime checks)
+// Health check — Railway uses this to confirm the service is up
 app.get("/health", (_req, res) => res.json({ ok: true, ts: Date.now() }));
 
-app.listen(WEBHOOK_PORT, () => {
-  console.log(`[Server] Listening on port ${WEBHOOK_PORT}`);
+// Catch-all so Railway's uptime pings on "/" also get a 200
+app.get("/", (_req, res) => res.json({ ok: true }));
+
+app.listen(PORT, () => {
+  console.log(`[Server] Listening on port ${PORT}`);
   if (PUBLIC_URL) {
-    console.log(`[Server] Razorpay webhook URL → ${PUBLIC_URL}/razorpay/webhook`);
+    console.log(`[Server] Webhook URL → ${PUBLIC_URL}/razorpay/webhook`);
   } else {
-    console.warn("[Server] PUBLIC_URL not set — Razorpay callbacks won't redirect correctly");
+    console.warn("[Server] PUBLIC_URL not set — payment callbacks won't redirect correctly");
   }
 });
 
-// ─── TELEGRAM BOT ─────────────────────────────────────────────────────────────
-const bot = new TelegramBot(BOT_TOKEN, {
-  polling: {
-    interval: 300,
-    autoStart: true,
-    params: {
-      timeout: 10
-    }
-  }
-});
+// ─── BOT COMMANDS ─────────────────────────────────────────────────────────────
 
-// In-memory sessions for multi-step flows (phone entry, OTP)
-const sessions  = {};
-const getSession  = (id) => { if (!sessions[id]) sessions[id] = { state: null, data: {} }; return sessions[id]; };
-const clearSession = (id) => { sessions[id] = { state: null, data: {} }; };
-
-// Markdown v2 escaper
-const esc = (s) => String(s ?? "").replace(/[_*[\]()~`>#+=|{}.!-]/g, "\\$&");
-
-// ─── /start ───────────────────────────────────────────────────────────────────
+// /start
 bot.onText(/\/start(?:\s+(.+))?/, async (msg, match) => {
   const userId = msg.from.id;
   upsertUser(userId, { username: msg.from.username || "" });
@@ -383,7 +394,7 @@ bot.onText(/\/start(?:\s+(.+))?/, async (msg, match) => {
     ? `📍 Pincode: *${esc(user.pincode)}* \\(${esc(user.substore || "")}\\)`
     : "📍 No pincode set yet\\.";
 
-  await bot.sendMessage(userId,
+  bot.sendMessage(userId,
     `👋 *Welcome to Amul Protein Stock Bot\\!*\n\n${pinLine}\n\n` +
     `*Free*\n` +
     `• /setpincode – Set your delivery pincode\n` +
@@ -391,7 +402,7 @@ bot.onText(/\/start(?:\s+(.+))?/, async (msg, match) => {
     `• /tracked – Your tracked products\n` +
     `• /favourites – Your favourites\n\n` +
     `*Premium* 🌟\n` +
-    `• /subscribe – View plans \\(₹5 / ₹10 / ₹30\\)\n` +
+    `• /subscribe – Plans \\(₹5 / ₹10 / ₹30\\)\n` +
     `• /autoorder – Auto\\-order on restock\n` +
     `• /login – Link your Amul account\n\n` +
     `/help – All commands`,
@@ -399,7 +410,7 @@ bot.onText(/\/start(?:\s+(.+))?/, async (msg, match) => {
   );
 });
 
-// ─── /help ────────────────────────────────────────────────────────────────────
+// /help
 bot.onText(/\/help/, (msg) =>
   bot.sendMessage(msg.from.id,
     `*Commands*\n\n` +
@@ -419,7 +430,7 @@ bot.onText(/\/help/, (msg) =>
   )
 );
 
-// ─── /setpincode ─────────────────────────────────────────────────────────────
+// /setpincode
 bot.onText(/\/setpincode(?:\s+(\d{6}))?/, async (msg, match) => {
   const userId  = msg.from.id;
   const pincode = match?.[1];
@@ -432,7 +443,7 @@ bot.onText(/\/setpincode(?:\s+(\d{6}))?/, async (msg, match) => {
 
   if (!info) {
     return bot.sendMessage(userId,
-      "❌ Pincode not found or not yet serviceable by Amul\\.\nDouble\\-check and try again\\.",
+      "❌ Pincode not found or not serviceable by Amul\\.\nDouble\\-check and try again\\.",
       { parse_mode: "MarkdownV2" }
     );
   }
@@ -444,20 +455,27 @@ bot.onText(/\/setpincode(?:\s+(\d{6}))?/, async (msg, match) => {
   );
 });
 
-// ─── /products ────────────────────────────────────────────────────────────────
+// /products
 bot.onText(/\/products(?:\s+(.+))?/, async (msg, match) => {
   const userId = msg.from.id;
   const query  = match?.[1]?.toLowerCase().trim();
   const user   = getUser(userId);
 
-  if (!user?.pincode) return bot.sendMessage(userId, "❗ Set your pincode first: /setpincode 680027");
+  if (!user?.pincode) {
+    return bot.sendMessage(userId, "❗ Set your pincode first: /setpincode 680027");
+  }
 
   const m        = await bot.sendMessage(userId, "🔄 Fetching products…");
   const products = await fetchProducts(user.substore);
   await bot.deleteMessage(userId, m.message_id).catch(() => {});
 
-  const list = query ? products.filter((p) => p.name.toLowerCase().includes(query)) : products;
-  if (!list.length) return bot.sendMessage(userId, "No products found for that search.");
+  const list = query
+    ? products.filter((p) => p.name.toLowerCase().includes(query))
+    : products;
+
+  if (!list.length) {
+    return bot.sendMessage(userId, "No products found for that search.");
+  }
 
   const trackedSkus = db.prepare("SELECT sku FROM tracked     WHERE user_id = ?").all(userId).map((r) => r.sku);
   const aoSkus      = db.prepare("SELECT sku FROM auto_orders WHERE user_id = ?").all(userId).map((r) => r.sku);
@@ -506,7 +524,7 @@ bot.onText(/\/products(?:\s+(.+))?/, async (msg, match) => {
   }
 });
 
-// ─── /tracked ─────────────────────────────────────────────────────────────────
+// /tracked
 bot.onText(/\/tracked/, async (msg) => {
   const userId = msg.from.id;
   const user   = getUser(userId);
@@ -536,6 +554,7 @@ bot.onText(/\/tracked/, async (msg) => {
       (isAO ? " 🤖" : "");
 
     const keyboard = [[{ text: "🔕 Untrack", callback_data: `untrack:${row.sku}` }]];
+
     if (subActive) {
       keyboard.push([
         isAO
@@ -543,6 +562,7 @@ bot.onText(/\/tracked/, async (msg) => {
           : { text: "🤖 Add Auto-Order",    callback_data: `addao:${row.sku}` },
       ]);
     }
+
     if (live) keyboard.push([{ text: "🛒 Buy on Amul", url: `${AMUL_BASE}/en/product/${live.alias}` }]);
 
     await bot.sendMessage(userId, text, {
@@ -552,21 +572,26 @@ bot.onText(/\/tracked/, async (msg) => {
   }
 });
 
-// ─── /favourites ──────────────────────────────────────────────────────────────
+// /favourites
 bot.onText(/\/favourites/, (msg) => {
   const rows = db.prepare("SELECT product FROM tracked WHERE user_id = ?").all(msg.from.id);
   if (!rows.length) {
-    return bot.sendMessage(msg.from.id, "No favourites yet\\. Track products via /products\\.", { parse_mode: "MarkdownV2" });
+    return bot.sendMessage(msg.from.id,
+      "No favourites yet\\. Track products via /products\\.",
+      { parse_mode: "MarkdownV2" }
+    );
   }
   let text = `*⭐ Favourites*\n\n`;
   rows.forEach((r) => { text += `• ${esc(r.product)}\n`; });
   bot.sendMessage(msg.from.id, text, { parse_mode: "MarkdownV2" });
 });
 
-// ─── /settings ────────────────────────────────────────────────────────────────
+// /settings
 bot.onText(/\/settings/, (msg) => {
   const user = getUser(msg.from.id);
-  if (!user) return bot.sendMessage(msg.from.id, "No settings yet\\. Start with /start", { parse_mode: "MarkdownV2" });
+  if (!user) {
+    return bot.sendMessage(msg.from.id, "No settings yet\\. Start with /start", { parse_mode: "MarkdownV2" });
+  }
 
   const sub = isSubscribed(user)
     ? `Active until ${new Date(user.sub_expires * 1000).toLocaleDateString("en-IN", { day: "numeric", month: "long", year: "numeric" })}`
@@ -583,7 +608,7 @@ bot.onText(/\/settings/, (msg) => {
   );
 });
 
-// ─── /subscribe ───────────────────────────────────────────────────────────────
+// /subscribe
 bot.onText(/\/subscribe/, async (msg) => {
   const userId = msg.from.id;
   const user   = getUser(userId);
@@ -600,7 +625,7 @@ bot.onText(/\/subscribe/, async (msg) => {
   bot.sendMessage(userId,
     `*🌟 Premium Plans*\n\n` +
     `Unlock auto\\-ordering — the bot places the order for you the moment a tracked product restocks\\.\n\n` +
-    `Choose a plan and pay securely via Razorpay\\. Your subscription activates *automatically* right after payment — no extra steps\\.`,
+    `Your subscription activates *automatically* right after payment — no extra steps\\.`,
     {
       parse_mode: "MarkdownV2",
       reply_markup: {
@@ -614,7 +639,7 @@ bot.onText(/\/subscribe/, async (msg) => {
   );
 });
 
-// ─── /autoorder ───────────────────────────────────────────────────────────────
+// /autoorder
 bot.onText(/\/autoorder/, async (msg) => {
   const userId = msg.from.id;
   const user   = getUser(userId);
@@ -659,11 +684,14 @@ bot.onText(/\/autoorder/, async (msg) => {
   bot.sendMessage(userId, text, { parse_mode: "MarkdownV2" });
 });
 
-// ─── /login ───────────────────────────────────────────────────────────────────
+// /login
 bot.onText(/\/login/, (msg) => {
   const userId = msg.from.id;
   if (!isSubscribed(getUser(userId))) {
-    return bot.sendMessage(userId, "⭐ Account linking is a premium feature\\. Use /subscribe first\\.", { parse_mode: "MarkdownV2" });
+    return bot.sendMessage(userId,
+      "⭐ Account linking is a premium feature\\. Use /subscribe first\\.",
+      { parse_mode: "MarkdownV2" }
+    );
   }
   getSession(userId).state = "awaiting_phone";
   bot.sendMessage(userId,
@@ -672,13 +700,80 @@ bot.onText(/\/login/, (msg) => {
   );
 });
 
-// ─── /cancel ─────────────────────────────────────────────────────────────────
+// /cancel
 bot.onText(/\/cancel/, (msg) => {
   clearSession(msg.from.id);
   bot.sendMessage(msg.from.id, "❌ Cancelled.");
 });
 
+// ─── TEXT HANDLER — multi-step state machine ──────────────────────────────────
+
+bot.on("message", async (msg) => {
+  if (!msg.text || msg.text.startsWith("/")) return;
+
+  const userId  = msg.from.id;
+  const session = getSession(userId);
+  const text    = msg.text.trim();
+
+  // Step 1 — phone number
+  if (session.state === "awaiting_phone") {
+    if (!/^\d{10}$/.test(text)) {
+      return bot.sendMessage(userId, "⚠️ Please enter a valid 10-digit mobile number.");
+    }
+    const m    = await bot.sendMessage(userId, "📨 Sending OTP…");
+    const resp = await amulSendOtp(text);
+    await bot.deleteMessage(userId, m.message_id).catch(() => {});
+
+    if (!resp) {
+      return bot.sendMessage(userId, "❌ Failed to send OTP. Check the number and try again, or use /cancel.");
+    }
+    session.state      = "awaiting_otp";
+    session.data.phone = text;
+    return bot.sendMessage(
+      userId,
+      `📨 OTP sent to *+91 ${esc(text)}*\\. Enter it here:`,
+      { parse_mode: "MarkdownV2" }
+    );
+  }
+
+  // Step 2 — OTP
+  if (session.state === "awaiting_otp") {
+    const m    = await bot.sendMessage(userId, "🔐 Verifying OTP…");
+    const resp = await amulVerifyOtp(session.data.phone, text);
+    await bot.deleteMessage(userId, m.message_id).catch(() => {});
+
+    if (!resp?.token) {
+      return bot.sendMessage(userId,
+        "❌ Incorrect OTP\\. Try again or use /login to restart\\.",
+        { parse_mode: "MarkdownV2" }
+      );
+    }
+
+    upsertUser(userId, {
+      phone:        session.data.phone,
+      amul_token:   resp.token,
+      amul_user_id: resp.user?._id || "",
+    });
+
+    const user    = getUser(userId);
+    const address = await fetchAmulAddress(resp.token, user?.substore || "default");
+    if (address) upsertUser(userId, { address });
+
+    clearSession(userId);
+
+    const updated = getUser(userId);
+    return bot.sendMessage(userId,
+      `✅ *Amul account linked\\!*\n\n` +
+      `Phone: ${esc(updated.phone)}\n` +
+      `Address: ${esc(updated.address || "Not set — update at shop\\.amul\\.com")}\n\n` +
+      `Use /autoorder to configure auto\\-ordering\\.`,
+      { parse_mode: "MarkdownV2" }
+    );
+  }
+});
+
 // ─── CALLBACK QUERIES ─────────────────────────────────────────────────────────
+
 bot.on("callback_query", async (query) => {
   const userId = query.from.id;
   const data   = query.data;
@@ -694,11 +789,12 @@ bot.on("callback_query", async (query) => {
 });
 
 // ─── PLAN SELECT → Razorpay Payment Link ─────────────────────────────────────
+
 async function handlePlanSelect(userId, plan) {
   if (!PLANS[plan]) return;
   const p = PLANS[plan];
 
-  // Re-use an existing pending payment link if one exists
+  // Re-use an existing pending payment link if one exists and is still valid
   const existing = db
     .prepare("SELECT * FROM payments WHERE user_id = ? AND plan = ? AND status = 'pending'")
     .get(userId);
@@ -707,7 +803,6 @@ async function handlePlanSelect(userId, plan) {
   if (existing) {
     try {
       link = await rzp.paymentLink.fetch(existing.payment_link_id);
-      // If the link has already been paid or cancelled, create a new one
       if (link.status !== "created") link = null;
     } catch { link = null; }
   }
@@ -736,72 +831,16 @@ async function handlePlanSelect(userId, plan) {
   );
 }
 
-// ─── TEXT HANDLER — multi-step state machine ──────────────────────────────────
-bot.on("message", async (msg) => {
-  if (!msg.text || msg.text.startsWith("/")) return;
-
-  const userId  = msg.from.id;
-  const session = getSession(userId);
-  const text    = msg.text.trim();
-
-  // ── Step 1: Phone number ───────────────────────────────────────────────────
-  if (session.state === "awaiting_phone") {
-    if (!/^\d{10}$/.test(text)) {
-      return bot.sendMessage(userId, "⚠️ Please enter a valid 10-digit mobile number.");
-    }
-    const m    = await bot.sendMessage(userId, "📨 Sending OTP…");
-    const resp = await amulSendOtp(text);
-    await bot.deleteMessage(userId, m.message_id).catch(() => {});
-
-    if (!resp) {
-      return bot.sendMessage(userId, "❌ Failed to send OTP. Check the number and try again, or use /cancel.");
-    }
-    session.state      = "awaiting_otp";
-    session.data.phone = text;
-    return bot.sendMessage(userId, `📨 OTP sent to *+91 ${esc(text)}*\\. Enter it here:`, { parse_mode: "MarkdownV2" });
-  }
-
-  // ── Step 2: OTP ───────────────────────────────────────────────────────────
-  if (session.state === "awaiting_otp") {
-    const m    = await bot.sendMessage(userId, "🔐 Verifying OTP…");
-    const resp = await amulVerifyOtp(session.data.phone, text);
-    await bot.deleteMessage(userId, m.message_id).catch(() => {});
-
-    if (!resp?.token) {
-      return bot.sendMessage(userId, "❌ Incorrect OTP\\. Try again or use /login to restart\\.", { parse_mode: "MarkdownV2" });
-    }
-
-    upsertUser(userId, {
-      phone: session.data.phone,
-      amul_token: resp.token,
-      amul_user_id: resp.user?._id || "",
-    });
-
-    const user    = getUser(userId);
-    const address = await fetchAmulAddress(resp.token, user?.substore || "default");
-    if (address) upsertUser(userId, { address });
-
-    clearSession(userId);
-
-    const updated = getUser(userId);
-    return bot.sendMessage(userId,
-      `✅ *Amul account linked\\!*\n\n` +
-      `Phone: ${esc(updated.phone)}\n` +
-      `Address: ${esc(updated.address || "Not set — update at shop\\.amul\\.com")}\n\n` +
-      `Use /autoorder to configure auto\\-ordering\\.`,
-      { parse_mode: "MarkdownV2" }
-    );
-  }
-});
-
 // ─── TRACK / UNTRACK / AUTO-ORDER helpers ────────────────────────────────────
+
 async function doTrack(userId, sku) {
   const user = getUser(userId);
   if (!user?.pincode) return bot.sendMessage(userId, "Set your pincode first: /setpincode");
   const products = await fetchProducts(user.substore);
   const p        = products.find((x) => x.sku === sku);
   if (!p) return bot.sendMessage(userId, "Product not found.");
-  db.prepare("INSERT OR IGNORE INTO tracked (user_id, sku, product) VALUES (?, ?, ?)").run(userId, sku, p.name);
+  db.prepare("INSERT OR IGNORE INTO tracked (user_id, sku, product) VALUES (?, ?, ?)")
+    .run(userId, sku, p.name);
   bot.sendMessage(userId,
     `🔔 *Tracking:* ${esc(p.name)}\n\nYou'll get a notification when it restocks\\.`,
     { parse_mode: "MarkdownV2" }
@@ -822,8 +861,10 @@ async function doAddAutoOrder(userId, sku) {
   const products = await fetchProducts(user.substore);
   const p        = products.find((x) => x.sku === sku);
   if (!p) return bot.sendMessage(userId, "Product not found.");
-  db.prepare("INSERT OR IGNORE INTO auto_orders (user_id, sku, product) VALUES (?, ?, ?)").run(userId, sku, p.name);
-  db.prepare("INSERT OR IGNORE INTO tracked    (user_id, sku, product) VALUES (?, ?, ?)").run(userId, sku, p.name);
+  db.prepare("INSERT OR IGNORE INTO auto_orders (user_id, sku, product) VALUES (?, ?, ?)")
+    .run(userId, sku, p.name);
+  db.prepare("INSERT OR IGNORE INTO tracked    (user_id, sku, product) VALUES (?, ?, ?)")
+    .run(userId, sku, p.name);
   bot.sendMessage(userId, `🤖 Auto-Order enabled for: *${esc(p.name)}*`, { parse_mode: "MarkdownV2" });
 }
 
@@ -834,10 +875,10 @@ async function doRemoveAutoOrder(userId, sku) {
 }
 
 // ─── STOCK CHECKER — every 5 minutes ─────────────────────────────────────────
+
 cron.schedule("*/5 * * * *", async () => {
   console.log("[Cron] Stock check started");
 
-  // Fetch each unique substore's product list just once per run
   const substoreProducts = {};
 
   const allTracked = db.prepare(`
@@ -848,6 +889,7 @@ cron.schedule("*/5 * * * *", async () => {
     WHERE  u.pincode IS NOT NULL
   `).all();
 
+  // Fetch each unique substore's products once per run
   for (const row of allTracked) {
     const key = row.substore || "default";
     if (!substoreProducts[key]) {
@@ -862,12 +904,11 @@ cron.schedule("*/5 * * * *", async () => {
 
     const inStock = p.available && p.inventory_quantity > 0;
     const nowSec  = Math.floor(Date.now() / 1000);
-    // last_seen = 0 means OOS; a recent timestamp means it was in stock last check
     const wasOOS  = !row.last_seen;
 
     if (inStock) {
       if (wasOOS) {
-        // ── Send restock notification ───────────────────────────────────
+        // Restock notification
         try {
           await bot.sendMessage(row.user_id,
             `🟢 *Back in Stock\\!*\n\n` +
@@ -886,7 +927,7 @@ cron.schedule("*/5 * * * *", async () => {
           console.error("[Cron] Notify error:", row.user_id, e.message);
         }
 
-        // ── Auto-order if eligible ──────────────────────────────────────
+        // Auto-order for eligible premium users
         const ao        = db.prepare("SELECT 1 FROM auto_orders WHERE user_id = ? AND sku = ?").get(row.user_id, row.sku);
         const subActive = row.sub_expires && row.sub_expires > nowSec;
 
@@ -904,12 +945,11 @@ cron.schedule("*/5 * * * *", async () => {
         }
       }
 
-      // Mark as in-stock
       db.prepare("UPDATE tracked SET last_seen = ? WHERE user_id = ? AND sku = ?")
         .run(nowSec, row.user_id, row.sku);
 
     } else if (row.last_seen) {
-      // Just went out of stock — clear last_seen so next restock triggers notification
+      // Just went out of stock — reset so next restock triggers notification
       db.prepare("UPDATE tracked SET last_seen = 0 WHERE user_id = ? AND sku = ?")
         .run(row.user_id, row.sku);
     }
